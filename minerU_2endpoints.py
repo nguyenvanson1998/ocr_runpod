@@ -10,7 +10,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple 
 from loguru import logger
 from base64 import b64encode
 from dotenv import load_dotenv
@@ -56,7 +56,7 @@ async def startup_event():
             output_dir=warmup_dir_temp,
             pdf_file_names=[warmup_pdf_name],
             pdf_bytes_list=[dummy_pdf_bytes],
-            p_lang_list=["en"],
+            p_lang_list=["ch"],
             backend="pipeline",
             parse_method="auto",
             formula_enable=True,
@@ -94,9 +94,9 @@ def generate_img_desc(img_path: str, img_caption: str) -> str:
         chat_model = GenerativeModel(model_name)
         source_img = Image.load_from_file(img_path)
         prompt = f"""You are an expert in image analysis. Your task is to describe the image in detail, including objects, actions, and context.
-                     The image already has a caption: \"{img_caption}\". Incorporate this information into your detailed description.
-                     If the image contains text, include a brief summary of the text content as well.
-                     Provide a comprehensive description that captures the essence of the image."""
+                      The image already has a caption: \"{img_caption}\". Incorporate this information into your detailed description.
+                      If the image contains text, include a brief summary of the text content as well.
+                      Provide a comprehensive description that captures the essence of the image."""
         content = [source_img, prompt]
         generation_config = {"temperature": 0.7}
         response = chat_model.generate_content(
@@ -123,6 +123,78 @@ def load_content_list_from_file(pdf_name: str, parse_dir: str) -> List[Dict]:
     except Exception as e:
         logger.error(f"Error loading content list from {content_list_path}: {e}")
         return []
+
+def _merge_small_chunks(chunks: List[Dict[str, Any]], min_chunk_size: int = 100) -> List[Dict[str, Any]]:
+    if len(chunks) <= 1 or min_chunk_size <= 0:
+        return chunks
+    
+    processed_chunks: List[Dict[str, Any]] = []
+
+    for i, current_chunk in enumerate(chunks):
+        is_image_chunk = current_chunk.get("image_description") is not None
+
+        if not processed_chunks:
+            processed_chunks.append(current_chunk)
+            continue
+
+        last_chunk = processed_chunks[-1]
+        last_chunk_is_image = last_chunk.get("image_description") is not None
+
+        if not is_image_chunk and not last_chunk_is_image and len(last_chunk.get("content", "")) < min_chunk_size:
+            processed_chunks.pop() 
+
+            merged_content = last_chunk.get("content", "") + "\n" + current_chunk.get("content", "")
+            
+            last_page_start = last_chunk.get("metadata", {}).get("pageStart", 0)
+            last_page_end = last_chunk.get("metadata", {}).get("pageEnd", 0)
+            current_page_start = current_chunk.get("metadata", {}).get("pageStart", 0)
+            current_page_end = current_chunk.get("metadata", {}).get("pageEnd", 0)
+
+            merged_metadata = {
+                "pageStart": min(last_page_start, current_page_start),
+                "pageEnd": max(last_page_end, current_page_end)
+            }
+            
+            merged_chunk = {
+                "content": merged_content,
+                "metadata": merged_metadata,
+                "image_description": None,
+                "image_base64": None
+            }
+            processed_chunks.append(merged_chunk)
+        else:
+            processed_chunks.append(current_chunk)
+
+    if len(processed_chunks) > 1 and \
+       processed_chunks[-1].get("image_description") is None and \
+       len(processed_chunks[-1].get("content", "")) < min_chunk_size and \
+       processed_chunks[-2].get("image_description") is None: 
+
+        last_chunk = processed_chunks.pop()
+        prev_chunk = processed_chunks.pop()
+
+        final_merged_content = prev_chunk.get("content", "") + "\n" + last_chunk.get("content", "")
+        
+        prev_page_start = prev_chunk.get("metadata", {}).get("pageStart", 0)
+        prev_page_end = prev_chunk.get("metadata", {}).get("pageEnd", 0)
+        last_page_start = last_chunk.get("metadata", {}).get("pageStart", 0)
+        last_page_end = last_chunk.get("metadata", {}).get("pageEnd", 0)
+
+        final_merged_metadata = {
+            "pageStart": min(prev_page_start, last_page_start),
+            "pageEnd": max(prev_page_end, last_page_end)
+        }
+        
+        final_merged_chunk = {
+            "content": final_merged_content,
+            "metadata": final_merged_metadata,
+            "image_description": None,
+            "image_base64": None
+        }
+        processed_chunks.append(final_merged_chunk)
+         
+    return processed_chunks
+
 
 async def _process_files_and_parse(
     files: List[UploadFile],
@@ -163,7 +235,7 @@ async def _process_files_and_parse(
                     processed_bytes = read_fn(temp_file_path)
                     pdf_bytes_list.append(processed_bytes)
                     pdf_file_names.append(file_stem)
-                    actual_lang_list_for_parse.append(lang_list[0] if lang_list else "en")
+                    actual_lang_list_for_parse.append(lang_list[0] if lang_list else "ch")
 
                     os.remove(temp_file_path)
                 except Exception as e:
@@ -200,8 +272,8 @@ async def _process_files_and_parse(
             f_dump_middle_json=False,
             f_dump_model_output=False,
             f_dump_orig_pdf=False,
-            f_dump_content_list=True,  
-            f_dump_images=dump_images,
+            f_dump_content_list=True, 
+            f_dump_images=dump_images, 
             start_page_id=start_page_id,
             end_page_id=end_page_id,
             **config
@@ -217,7 +289,7 @@ async def _process_files_and_parse(
 async def process_document_ocr_mode(
     files: List[UploadFile] = File(...),
     output_dir: str = Form("./output_minerU"),
-    lang_list: List[str] = Form(["en"]),
+    lang_list: List[str] = Form(["ch"]),
     backend: str = Form("pipeline"),
     parse_method: str = Form("auto"),
     formula_enable: bool = Form(True),
@@ -225,9 +297,10 @@ async def process_document_ocr_mode(
     server_url: Optional[str] = Form(None),
     start_page_id: int = Form(0),
     end_page_id: int = Form(9999),
+    min_chunk_size: int = Form(100),
 ):
     config = getattr(app.state, "config", {})
-    processed_results = []
+    processed_results_raw = [] 
     batch_unique_dir = None
     loop = asyncio.get_event_loop()
 
@@ -322,7 +395,7 @@ async def process_document_ocr_mode(
                 text_buffer = page_data["text_buffer"].strip()
 
                 if text_buffer:
-                    processed_results.append({
+                    processed_results_raw.append({
                         "content": text_buffer,
                         "metadata": {
                             "pageStart": page_idx,
@@ -347,9 +420,9 @@ async def process_document_ocr_mode(
                                 image_caption
                             )
                             
-                            processed_results.append({
+                            processed_results_raw.append({
                                 "content": image_caption,
-                                "metadata": {"page": page_idx},
+                                "metadata": {"pageStart": page_idx, "pageEnd": page_idx},
                                 "image_description": image_description,
                                 "image_base64": encoded_image
                             })
@@ -358,13 +431,15 @@ async def process_document_ocr_mode(
                             logger.error(f"Error processing image {image_full_path}: {e}")
                     else:
                         logger.warning(f"Image file not found at {image_full_path}")
+        
+        final_processed_results = _merge_small_chunks(processed_results_raw, min_chunk_size)
 
-        logger.info(f"All files processed and post-processed for full content. Total chunks: {len(processed_results)}")
+        logger.info(f"All files processed and post-processed for full content. Total chunks: {len(final_processed_results)}")
 
         return JSONResponse(
             status_code=200,
             content={
-                "minerU_processed_document": processed_results,
+                "minerU_processed_document": final_processed_results,
             }
         )
         
@@ -386,17 +461,18 @@ async def process_document_ocr_mode(
 async def process_document_text_only(
     files: List[UploadFile] = File(...),
     output_dir: str = Form("./output_minerU"),
-    lang_list: List[str] = Form(["en"]),
+    lang_list: List[str] = Form(["ch"]),
     backend: str = Form("pipeline"),
     parse_method: str = Form("auto"),
     formula_enable: bool = Form(True),
     table_enable: bool = Form(True),
     server_url: Optional[str] = Form(None),
     start_page_id: int = Form(0),
-    end_page_id: int = Form(9999),
+    end_page_id: int = Form(999),
+    min_chunk_size: int = Form(100),
 ):
     config = getattr(app.state, "config", {})
-    processed_results = []
+    processed_results_raw = [] 
     batch_unique_dir = None
 
     try:
@@ -412,7 +488,7 @@ async def process_document_text_only(
             start_page_id=start_page_id,
             end_page_id=end_page_id,
             config=config,
-            dump_images=False
+            dump_images=False 
         )
 
         for file_idx, pdf_name in enumerate(pdf_file_names):
@@ -465,7 +541,7 @@ async def process_document_text_only(
             for page_idx in sorted(current_page_text_buffer.keys()):
                 text_content = current_page_text_buffer[page_idx].strip()
                 if text_content:
-                    processed_results.append({
+                    processed_results_raw.append({
                         "content": text_content,
                         "metadata": {
                             "pageStart": page_idx,
@@ -473,13 +549,15 @@ async def process_document_text_only(
                         }
                     })
                     logger.info(f"Added text chunk for page {page_idx}.")
+        
+        final_processed_results = _merge_small_chunks(processed_results_raw, min_chunk_size)
 
-        logger.info(f"All files processed for text-only content. Total chunks: {len(processed_results)}")
+        logger.info(f"All files processed for text-only content. Total chunks: {len(final_processed_results)}")
 
         return JSONResponse(
             status_code=200,
             content={
-                "minerU_processed_document": processed_results,
+                "minerU_processed_document": final_processed_results,
             }
         )
         
