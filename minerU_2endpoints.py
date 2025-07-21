@@ -135,7 +135,8 @@ async def _process_files_and_parse(
     server_url: Optional[str],
     start_page_id: int,
     end_page_id: int,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    dump_images: bool = True,
 ):
     batch_unique_dir = None
     try:
@@ -200,7 +201,7 @@ async def _process_files_and_parse(
             f_dump_model_output=False,
             f_dump_orig_pdf=False,
             f_dump_content_list=True,  
-            f_dump_images=True,
+            f_dump_images=dump_images,
             start_page_id=start_page_id,
             end_page_id=end_page_id,
             **config
@@ -242,7 +243,8 @@ async def process_document_ocr_mode(
             server_url=server_url,
             start_page_id=start_page_id,
             end_page_id=end_page_id,
-            config=config
+            config=config,
+            dump_images=True
         )
 
         for file_idx, pdf_name in enumerate(pdf_file_names):
@@ -409,7 +411,8 @@ async def process_document_text_only(
             server_url=server_url,
             start_page_id=start_page_id,
             end_page_id=end_page_id,
-            config=config
+            config=config,
+            dump_images=False
         )
 
         for file_idx, pdf_name in enumerate(pdf_file_names):
