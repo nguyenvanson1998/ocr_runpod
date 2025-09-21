@@ -16,6 +16,16 @@ from base64 import b64encode
 from dotenv import load_dotenv
 import asyncio
 import json
+import time
+from datetime import datetime
+import gc
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    logger.warning("PyTorch not available - GPU cleanup will be skipped")
 
 from vertexai.generative_models import GenerativeModel, Image
 from PIL import Image as PILImage
@@ -80,9 +90,21 @@ async def startup_event():
         logger.error(f"Error during warmup: {str(e)}")
         logger.exception(e)
     finally:
+        # Clean up GPU memory after warmup
+        cleanup_gpu_memory()
+        
         if os.path.exists(warmup_dir_temp):
             shutil.rmtree(warmup_dir_temp, ignore_errors=True)
             logger.info(f"Cleaned up warmup directory: {warmup_dir_temp}")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for container orchestration and load balancers"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": __version__
+    }
 
 def encode_image(image_path: str) -> str:
     with open(image_path, "rb") as f:
@@ -103,6 +125,12 @@ def generate_img_desc(img_path: str, img_caption: str) -> str:
             content,
             generation_config=generation_config
         )
+        
+        # Clean up GPU memory after image processing
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            
         return response.text
     except Exception as e:
         logger.error(f"Error generating image description for {img_path}: {e}")
@@ -149,10 +177,14 @@ def _merge_small_chunks(chunks: List[Dict[str, Any]], min_chunk_size: int = 100)
             last_page_end = last_chunk.get("metadata", {}).get("pageEnd", 0)
             current_page_start = current_chunk.get("metadata", {}).get("pageStart", 0)
             current_page_end = current_chunk.get("metadata", {}).get("pageEnd", 0)
+            
+            # Preserve filename from the last chunk or current chunk
+            filename = last_chunk.get("metadata", {}).get("filename") or current_chunk.get("metadata", {}).get("filename")
 
             merged_metadata = {
                 "pageStart": min(last_page_start, current_page_start),
-                "pageEnd": max(last_page_end, current_page_end)
+                "pageEnd": max(last_page_end, current_page_end),
+                "filename": filename
             }
             
             merged_chunk = {
@@ -179,10 +211,14 @@ def _merge_small_chunks(chunks: List[Dict[str, Any]], min_chunk_size: int = 100)
         prev_page_end = prev_chunk.get("metadata", {}).get("pageEnd", 0)
         last_page_start = last_chunk.get("metadata", {}).get("pageStart", 0)
         last_page_end = last_chunk.get("metadata", {}).get("pageEnd", 0)
+        
+        # Preserve filename from either chunk
+        filename = prev_chunk.get("metadata", {}).get("filename") or last_chunk.get("metadata", {}).get("filename")
 
         final_merged_metadata = {
             "pageStart": min(prev_page_start, last_page_start),
-            "pageEnd": max(prev_page_end, last_page_end)
+            "pageEnd": max(prev_page_end, last_page_end),
+            "filename": filename
         }
         
         final_merged_chunk = {
@@ -194,6 +230,60 @@ def _merge_small_chunks(chunks: List[Dict[str, Any]], min_chunk_size: int = 100)
         processed_chunks.append(final_merged_chunk)
          
     return processed_chunks
+
+
+def cleanup_old_temp_directories(output_dir: str, max_age_hours: int = 24):
+    """Clean up old temporary directories that might be left over"""
+    try:
+        import glob
+        import time
+        
+        # Look for UUID-named directories in the output directory
+        temp_pattern = os.path.join(output_dir, "*-*-*-*-*")
+        temp_dirs = glob.glob(temp_pattern)
+        
+        current_time = time.time()
+        cleaned_count = 0
+        
+        for temp_dir in temp_dirs:
+            if os.path.isdir(temp_dir):
+                try:
+                    dir_age_hours = (current_time - os.path.getctime(temp_dir)) / 3600
+                    if dir_age_hours > max_age_hours:
+                        logger.info(f"Cleaning up old temporary directory: {temp_dir} (age: {dir_age_hours:.2f} hours)")
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        cleaned_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to check/cleanup old directory {temp_dir}: {e}")
+        
+        if cleaned_count > 0:
+            logger.info(f"Cleaned up {cleaned_count} old temporary directories")
+        
+    except Exception as e:
+        logger.warning(f"Error during old temp directories cleanup: {e}")
+
+
+def cleanup_gpu_memory():
+    """Clean up GPU memory after processing"""
+    try:
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            # Clear GPU cache
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            torch.cuda.ipc_collect()  # Collect IPC memory
+            # Get GPU memory info for logging
+            allocated = torch.cuda.memory_allocated() / 1024**3  # Convert to GB
+            cached = torch.cuda.memory_reserved() / 1024**3      # Convert to GB
+            
+            logger.info(f"GPU memory cleanup completed - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
+        else:
+            logger.debug("GPU cleanup skipped - CUDA not available or PyTorch not installed")
+            
+        # Force garbage collection
+        gc.collect()
+        
+    except Exception as e:
+        logger.warning(f"Error during GPU memory cleanup: {e}")
 
 
 async def _process_files_and_parse(
@@ -282,7 +372,12 @@ async def _process_files_and_parse(
         return batch_unique_dir, pdf_file_names
     except Exception as e:
         if batch_unique_dir and os.path.exists(batch_unique_dir):
-            shutil.rmtree(batch_unique_dir, ignore_errors=True)
+            try:
+                logger.info(f"[Parse Error] Cleaning up temporary directory: {batch_unique_dir}")
+                shutil.rmtree(batch_unique_dir, ignore_errors=True)
+                logger.info(f"[Parse Error] Successfully cleaned up temporary directory: {batch_unique_dir}")
+            except Exception as cleanup_error:
+                logger.error(f"[Parse Error] Failed to cleanup temporary directory {batch_unique_dir}: {cleanup_error}")
         raise e
 
 @app.post(path="/process_document_ocr_mode")
@@ -299,12 +394,22 @@ async def process_document_ocr_mode(
     end_page_id: int = Form(9999),
     min_chunk_size: int = Form(100),
 ):
+    # Start timing
+    start_time = time.time()
+    start_datetime = datetime.now()
+    
+    # Clean up old temporary directories first
+    cleanup_old_temp_directories(output_dir)
+    
     config = getattr(app.state, "config", {})
     processed_results_raw = [] 
     batch_unique_dir = None
     loop = asyncio.get_event_loop()
 
     try:
+        # Track parsing time
+        parse_start_time = time.time()
+        
         batch_unique_dir, pdf_file_names = await _process_files_and_parse(
             files=files,
             output_dir=output_dir,
@@ -319,6 +424,12 @@ async def process_document_ocr_mode(
             config=config,
             dump_images=True
         )
+        
+        parse_end_time = time.time()
+        parse_duration = parse_end_time - parse_start_time
+        
+        # Track processing time
+        processing_start_time = time.time()
 
         for file_idx, pdf_name in enumerate(pdf_file_names):
             if backend.startswith("pipeline"):
@@ -400,11 +511,12 @@ async def process_document_ocr_mode(
                         "metadata": {
                             "pageStart": page_idx,
                             "pageEnd": page_idx,
+                            "filename": files[file_idx].filename
                         },
                         "image_description": None,
                         "image_base64": None
                     })
-                    logger.info(f"Added text chunk for page {page_idx}.")
+                    logger.info(f"Added text chunk for page {page_idx} from file {files[file_idx].filename}.")
 
                 for img_info in page_data["images"]:
                     image_full_path = img_info["path"]
@@ -422,24 +534,60 @@ async def process_document_ocr_mode(
                             
                             processed_results_raw.append({
                                 "content": image_caption,
-                                "metadata": {"pageStart": page_idx, "pageEnd": page_idx},
+                                "metadata": {
+                                    "pageStart": page_idx, 
+                                    "pageEnd": page_idx,
+                                    "filename": files[file_idx].filename
+                                },
                                 "image_description": image_description,
                                 "image_base64": encoded_image
                             })
-                            logger.info(f"Added image chunk for page {page_idx}.")
+                            logger.info(f"Added image chunk for page {page_idx} from file {files[file_idx].filename}.")
                         except Exception as e:
                             logger.error(f"Error processing image {image_full_path}: {e}")
                     else:
                         logger.warning(f"Image file not found at {image_full_path}")
         
-        final_processed_results = _merge_small_chunks(processed_results_raw, min_chunk_size)
+        processing_end_time = time.time()
+        processing_duration = processing_end_time - processing_start_time
+        
+        # Skip merging small chunks - use raw results directly
+        final_processed_results = processed_results_raw
+
+        # Calculate total time
+        end_time = time.time()
+        total_duration = end_time - start_time
+        end_datetime = datetime.now()
 
         logger.info(f"All files processed and post-processed for full content. Total chunks: {len(final_processed_results)}")
+        logger.info(f"Processing times - Parse: {parse_duration:.2f}s, Processing: {processing_duration:.2f}s, Total: {total_duration:.2f}s")
 
         return JSONResponse(
             status_code=200,
             content={
                 "minerU_processed_document": final_processed_results,
+                "processing_info": {
+                    "total_chunks": len(final_processed_results),
+                    "total_files": len(pdf_file_names),
+                    "file_names": pdf_file_names,
+                    "timing": {
+                        "start_time": start_datetime.isoformat(),
+                        "end_time": end_datetime.isoformat(),
+                        "total_duration_seconds": round(total_duration, 2),
+                        "parse_duration_seconds": round(parse_duration, 2),
+                        "processing_duration_seconds": round(processing_duration, 2),
+                        "total_duration_formatted": f"{int(total_duration // 60)}m {int(total_duration % 60)}s",
+                        "parse_duration_formatted": f"{int(parse_duration // 60)}m {int(parse_duration % 60)}s",
+                        "processing_duration_formatted": f"{int(processing_duration // 60)}m {int(processing_duration % 60)}s"
+                    },
+                    "config": {
+                        "backend": backend,
+                        "parse_method": parse_method,
+                        "formula_enable": formula_enable,
+                        "table_enable": table_enable,
+                        "page_range": f"{start_page_id}-{end_page_id}"
+                    }
+                }
             }
         )
         
@@ -452,9 +600,18 @@ async def process_document_ocr_mode(
             detail=f"An unexpected error occurred during processing: {str(e)}"
         )
     finally:
+        # Clean up GPU memory
+        cleanup_gpu_memory()
+        
         if batch_unique_dir and os.path.exists(batch_unique_dir):
-            logger.info(f"Cleaning up temporary directory: {batch_unique_dir}")
-            shutil.rmtree(batch_unique_dir, ignore_errors=True)
+            try:
+                logger.info(f"[OCR Mode] Cleaning up temporary directory: {batch_unique_dir}")
+                shutil.rmtree(batch_unique_dir, ignore_errors=True)
+                logger.info(f"[OCR Mode] Successfully cleaned up temporary directory: {batch_unique_dir}")
+            except Exception as cleanup_error:
+                logger.error(f"[OCR Mode] Failed to cleanup temporary directory {batch_unique_dir}: {cleanup_error}")
+        else:
+            logger.info("[OCR Mode] No temporary directory to clean up or directory doesn't exist.")
 
 
 @app.post(path="/process_document_text_only")
@@ -471,11 +628,21 @@ async def process_document_text_only(
     end_page_id: int = Form(999),
     min_chunk_size: int = Form(100),
 ):
+    # Start timing
+    start_time = time.time()
+    start_datetime = datetime.now()
+    
+    # Clean up old temporary directories first
+    cleanup_old_temp_directories(output_dir)
+    
     config = getattr(app.state, "config", {})
     processed_results_raw = [] 
     batch_unique_dir = None
 
     try:
+        # Track parsing time
+        parse_start_time = time.time()
+        
         batch_unique_dir, pdf_file_names = await _process_files_and_parse(
             files=files,
             output_dir=output_dir,
@@ -490,6 +657,12 @@ async def process_document_text_only(
             config=config,
             dump_images=False 
         )
+        
+        parse_end_time = time.time()
+        parse_duration = parse_end_time - parse_start_time
+        
+        # Track text processing time
+        processing_start_time = time.time()
 
         for file_idx, pdf_name in enumerate(pdf_file_names):
             if backend.startswith("pipeline"):
@@ -546,18 +719,52 @@ async def process_document_text_only(
                         "metadata": {
                             "pageStart": page_idx,
                             "pageEnd": page_idx,
+                            "filename": files[file_idx].filename
                         }
                     })
-                    logger.info(f"Added text chunk for page {page_idx}.")
+                    logger.info(f"Added text chunk for page {page_idx} from file {files[file_idx].filename}.")
         
-        final_processed_results = _merge_small_chunks(processed_results_raw, min_chunk_size)
+        processing_end_time = time.time()
+        processing_duration = processing_end_time - processing_start_time
+        
+        # Skip merging small chunks - use raw results directly
+        final_processed_results = processed_results_raw
+
+        # Calculate total time
+        end_time = time.time()
+        total_duration = end_time - start_time
+        end_datetime = datetime.now()
 
         logger.info(f"All files processed for text-only content. Total chunks: {len(final_processed_results)}")
+        logger.info(f"Processing times - Parse: {parse_duration:.2f}s, Processing: {processing_duration:.2f}s, Total: {total_duration:.2f}s")
 
         return JSONResponse(
             status_code=200,
             content={
                 "minerU_processed_document": final_processed_results,
+                "processing_info": {
+                    "total_chunks": len(final_processed_results),
+                    "total_files": len(pdf_file_names),
+                    "file_names": pdf_file_names,
+                    "timing": {
+                        "start_time": start_datetime.isoformat(),
+                        "end_time": end_datetime.isoformat(),
+                        "total_duration_seconds": round(total_duration, 2),
+                        "parse_duration_seconds": round(parse_duration, 2),
+                        "processing_duration_seconds": round(processing_duration, 2),
+                        "total_duration_formatted": f"{int(total_duration // 60)}m {int(total_duration % 60)}s",
+                        "parse_duration_formatted": f"{int(parse_duration // 60)}m {int(parse_duration % 60)}s",
+                        "processing_duration_formatted": f"{int(processing_duration // 60)}m {int(processing_duration % 60)}s"
+                    },
+                    "config": {
+                        "backend": backend,
+                        "parse_method": parse_method,
+                        "formula_enable": formula_enable,
+                        "table_enable": table_enable,
+                        "page_range": f"{start_page_id}-{end_page_id}",
+                        "mode": "text_only"
+                    }
+                }
             }
         )
         
@@ -570,14 +777,23 @@ async def process_document_text_only(
             detail=f"An unexpected error occurred during processing: {str(e)}"
         )
     finally:
+        # Clean up GPU memory
+        cleanup_gpu_memory()
+        
         if batch_unique_dir and os.path.exists(batch_unique_dir):
-            logger.info(f"Cleaning up temporary directory: {batch_unique_dir}")
-            shutil.rmtree(batch_unique_dir, ignore_errors=True)
+            try:
+                logger.info(f"[Text Only Mode] Cleaning up temporary directory: {batch_unique_dir}")
+                shutil.rmtree(batch_unique_dir, ignore_errors=True)
+                logger.info(f"[Text Only Mode] Successfully cleaned up temporary directory: {batch_unique_dir}")
+            except Exception as cleanup_error:
+                logger.error(f"[Text Only Mode] Failed to cleanup temporary directory {batch_unique_dir}: {cleanup_error}")
+        else:
+            logger.info("[Text Only Mode] No temporary directory to clean up or directory doesn't exist.")
 
 @click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
 @click.pass_context
 @click.option('--host', default='0.0.0.0', help='Server host')
-@click.option('--port', default=8000, type=int, help='Server port (default: 8000)')
+@click.option('--port', default=80, type=int, help='Server port (default: 8000)')
 @click.option('--reload', is_flag=True, help='Enable auto-reload (development mode)')
 def main(ctx, host, port, reload, **kwargs):
     kwargs.update(arg_parse(ctx))

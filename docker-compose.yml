@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  mineru-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mineru-api
+    ports:
+      - "8002:8002"
+    volumes:
+      # Mount output directory to persist results
+      - ./output_minerU:/app/output_minerU
+      # Mount test files directory
+      - ./files_test:/app/files_test
+      # Mount logs directory
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Add any environment variables your app needs
+      # - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+    networks:
+      - mineru-network
+
+  # Optional: Add nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: mineru-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      # - ./ssl:/etc/nginx/ssl:ro  # Uncomment for SSL
+    depends_on:
+      - mineru-api
+    restart: unless-stopped
+    networks:
+      - mineru-network
+
+networks:
+  mineru-network:
+    driver: bridge
+
+volumes:
+  mineru-data:
