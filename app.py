@@ -19,6 +19,8 @@ import json
 import time
 from datetime import datetime
 import gc
+import os
+os.environ['MINERU_MODEL_SOURCE'] = 'local'
 
 try:
     import torch
@@ -96,6 +98,10 @@ async def startup_event():
         if os.path.exists(warmup_dir_temp):
             shutil.rmtree(warmup_dir_temp, ignore_errors=True)
             logger.info(f"Cleaned up warmup directory: {warmup_dir_temp}")
+
+@app.get("/ping")
+async def health_check():
+    return {"status": "healthy"}
 
 @app.get("/health")
 async def health_check():
@@ -790,25 +796,16 @@ async def process_document_text_only(
         else:
             logger.info("[Text Only Mode] No temporary directory to clean up or directory doesn't exist.")
 
-@click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
-@click.pass_context
-@click.option('--host', default='0.0.0.0', help='Server host')
-@click.option('--port', default=80, type=int, help='Server port (default: 8000)')
-@click.option('--reload', is_flag=True, help='Enable auto-reload (development mode)')
-def main(ctx, host, port, reload, **kwargs):
-    kwargs.update(arg_parse(ctx))
-    app.state.config = kwargs
+def main():
 
-    print(f"Start MinerU FastAPI Service (development mode): http://{host}:{port}")
     print("The API documentation can be accessed at the following address:")
-    print(f"- Swagger UI: http://{host}:{port}/docs")
-    print(f"- ReDoc: http://{host}:{port}/redoc")
+    print(f"- Swagger UI: http://0.0.0.0:5000/docs")
+    print(f"- ReDoc: http://0.0.0.0:5000/redoc")
 
     uvicorn.run(
-        "minerU_2endpoints:app",
-        host=host,
-        port=port,
-        reload=reload,
+        app,
+        host="0.0.0.0",
+        port=5001
     )
 
 if __name__ == "__main__":

@@ -1,59 +1,67 @@
-# Dockerfile for MinerU API Service
-FROM python:3.10-slim
+# Dockerfile for MinerU API Service (fixed OpenCV deps & entrypoint)
+FROM nvidia/cuda:12.1.0-base-ubuntu22.04
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    MINERU_MODEL_SOURCE=local
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    software-properties-common \
-    git \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \
-    libgcc-s1 \
-    libc6 \
-    ffmpeg \
-    libsndfile1 \
+# System deps (fonts + OpenCV runtime + basics)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-pip \
+        python3-dev \
+        ca-certificates \
+        fonts-noto-core \
+        fonts-noto-cjk \
+        fontconfig \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+        ffmpeg \
+        libopencv-dev \
+        python3-opencv \
+        build-essential \
+        curl \
+        git \
+    && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /app
+# Ensure CUDA compat libs are visible (usually harmless if already present)
+RUN ldconfig /usr/local/cuda-12.1/compat/ || true
 
-# Copy requirements first for better Docker layer caching
-COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# Copy requirements first for better caching
+COPY requirements.txt ./requirements.txt
 
-# Copy application code
+# Python deps
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+ && python3 -m pip install --no-cache-dir -r ./requirements.txt
+
+# App code
 COPY . .
 
-# Create necessary directories
-RUN mkdir -p /app/files_test /app/output_minerU /app/logs
+# NOTE: If your base image already has pip in /usr/local, --break-system-packages helps on Ubuntu 22.04
+# RUN python3 -m pip install 'mineru[core]' --break-system-packages \
+#  && python3 -m pip cache purge
 
-# Set proper permissions
-RUN chmod +x manage_service.sh stop_all_services.sh
+# (Optional) Pre-download models during build. Comment this out if you prefer to pull at runtime.
+RUN /bin/bash -lc "mineru-models-download -s huggingface -m all || true"
 
-# Create a non-root user for security
-RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
-USER appuser
+# Create runtime dirs
+RUN mkdir -p ./files_test ./output_minerU ./logs ./models
 
-# Expose the port
-EXPOSE 80
+# Ensure we run as root (this is default, but explicit)
+USER root
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:80/health || exit 1
+EXPOSE 5001
 
-# Default command - can be overridden
-CMD ["python3", "minerU_2endpoints.py"]
+# Simple, reliable startup
+CMD ["python3", "app.py"]
+
+
+
+
+
