@@ -44,18 +44,18 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip \
 COPY . .
 
 # NOTE: If your base image already has pip in /usr/local, --break-system-packages helps on Ubuntu 22.04
-# RUN python3 -m pip install 'mineru[core]' --break-system-packages \
-#  && python3 -m pip cache purge
+RUN python3 -m pip install 'mineru[core]' --break-system-packages \
+ && python3 -m pip cache purge
 
 # (Optional) Pre-download models during build. Comment this out if you prefer to pull at runtime.
-RUN /bin/bash -lc "mineru-models-download -s huggingface -m all || true"
+
 
 # Create runtime dirs
 RUN mkdir -p ./files_test ./output_minerU ./logs ./models
 
 # Ensure we run as root (this is default, but explicit)
 USER root
-
+RUN /bin/bash -lc "mineru-models-download -s huggingface -m all || true"
 EXPOSE 5001
 
 # Simple, reliable startup
