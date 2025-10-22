@@ -29,39 +29,44 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
-# Ensure CUDA compat libs are visible (usually harmless if already present)
+# Ensure CUDA compat libs are visible
 RUN ldconfig /usr/local/cuda-12.1/compat/ || true
-
 
 # Copy requirements first for better caching
 COPY requirements.txt ./requirements.txt
 
 # Python deps
-RUN python3 -m pip install --no-cache-dir --upgrade pip \
- && python3 -m pip install --no-cache-dir -r ./requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip
 
-# App code
-COPY . .
 
-# NOTE: If your base image already has pip in /usr/local, --break-system-packages helps on Ubuntu 22.04
+# Install MinerU
 RUN python3 -m pip install 'mineru[core]' --break-system-packages \
  && python3 -m pip cache purge
+ 
+RUN python3 -m pip install --no-cache-dir -r ./requirements.txt
+# Create runtime dirs BEFORE downloading models
+RUN mkdir -p /root/.mineru /root/.cache/huggingface ./models ./files_test ./output_minerU ./logs
 
-# (Optional) Pre-download models during build. Comment this out if you prefer to pull at runtime.
+# Download models with proper environment and config
+# This is the critical fix - ensure models are downloaded to correct location
+RUN export HOME=/root && \
+    export MINERU_MODEL_SOURCE=local && \
+    mkdir -p /root/.mineru && \
+    echo '{"models": {}}' > /root/.mineru/magic-pdf.json && \
+    mineru-models-download -s huggingface -m all && \
+    ls -la /root/.mineru/ && \
+    cat /root/.mineru/magic-pdf.json || echo "Config file missing"
 
+# Copy app code
+COPY . .
 
-# Create runtime dirs
-RUN mkdir -p ./files_test ./output_minerU ./logs ./models
+# Ensure correct permissions
+RUN chmod -R 755 /root/.mineru ./models
 
-# Ensure we run as root (this is default, but explicit)
-USER root
-RUN /bin/bash -lc "mineru-models-download -s huggingface -m all || true"
+# Set working directory
+WORKDIR /
+
 EXPOSE 5001
 
 # Simple, reliable startup
 CMD ["python3", "app.py"]
-
-
-
-
-

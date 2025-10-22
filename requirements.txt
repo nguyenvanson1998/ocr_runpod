@@ -37,10 +37,10 @@ google-cloud-core==2.4.3
 google-cloud-documentai==3.5.0
 google-cloud-resource-manager==1.14.2
 google-cloud-storage==2.19.0
-transformers>=4.20.0  # Only if using specific transformers
+transformers  # Only if using specific transformers
 
 # MinerU and related OCR dependencies
-mineru==2.1.10
+# mineru==2.1.10
 doclayout-yolo>=0.1.0
 ultralytics>=8.0.0
 numpy>=1.21.0
